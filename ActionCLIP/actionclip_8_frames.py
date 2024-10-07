@@ -15,6 +15,9 @@ import cv2
 from collections import deque
 import random
 
+text_aug = [f"The person is {{}}" ,f"The man is {{}}", f"The woman is {{}}", f"The human is {{}}", f"a photo of action {{}}" ,f"a picture of action {{}}",
+                f"a video of action {{}}", f"Human action of {{}}"]
+
 parser = ArgumentParser()
 
 parser.add_argument(
@@ -141,8 +144,6 @@ def text_prompt():
     #             f"Playing a kind of action, {{}}", f"Doing a kind of action, {{}}", f"Look, the human is {{}}",
     #             f"Can you recognize the action of {{}}?", f"Video classification of {{}}", f"A video of {{}}",
     #             f"The man is {{}}", f"The woman is {{}}"]
-    text_aug = [f"The person is {{}}" ,f"The man is {{}}", f"The woman is {{}}", f"The human is {{}}", f"a photo of action {{}}" ,f"a picture of action {{}}",
-                f"a video of action {{}}", f"Human action of {{}}"]
     text_dict = {}
     num_text_aug = len(text_aug)
     data_classes = [[i, action] for i, action in enumerate(args.actions)]
@@ -170,12 +171,14 @@ def predict_action(frames, id2action, model, fusion_model, text_features, config
         image_features /= image_features.norm(dim=-1, keepdim=True)
         text_features /= text_features.norm(dim=-1, keepdim=True)
         similarity = (100.0 * image_features @ text_features.T)
-        similarity = similarity.view(b, 8, -1).softmax(dim=-1)
+        similarity = similarity.view(b, len(text_aug), -1).softmax(dim=-1)
         similarity = similarity.mean(dim=1, keepdim=False)
         idx = similarity.argmax(dim=1).item()
         prob = torch.max(similarity, dim=1)[0]
     # if prob < args.filter_action_prob:
     #     return 'others'
+    if id2action[idx] not in ['walk', 'sit', 'stand', 'interact']:
+        return 'others'
     return id2action[idx]
 
 def main():
@@ -253,13 +256,14 @@ def main():
                     object_frames[person_id].append(frame[y1:y2, x1:x2])
                     text = f'{frame_cnt},{person_id},{x11},{y11},{x22},{y22},'
                     action = "Detecting..."
-                    if len(object_frames[person_id]) == args.num_frames:
-                        action = predict_action(object_frames[person_id], id2action, model, fusion_model, text_features, config, device)
-                        text += action + '\n'
-                    else:
-                        tmp_object_frames = list(object_frames[person_id]) + [frame[y1:y2, x1:x2]] * (args.num_frames - len(object_frames[person_id]))
-                        action = predict_action(tmp_object_frames, id2action, model, fusion_model, text_features, config, device)
-                        text += action + '\n'
+                    if frame_cnt == args.num_frames - 1:
+                        if len(object_frames[person_id]) == args.num_frames:
+                            action = predict_action(object_frames[person_id], id2action, model, fusion_model, text_features, config, device)
+                        else:
+                            tmp_object_frames = list(object_frames[person_id]) + [frame[y1:y2, x1:x2]] * (args.num_frames - len(object_frames[person_id]))
+                            action = predict_action(tmp_object_frames, id2action, model, fusion_model, text_features, config, device)
+                    
+                    text += action + '\n'
 
                     annotated_frame = cv2.rectangle(annotated_frame, (x11, y11), (x22, y22),
                                                     (colors[person_id % len(colors)]), 2)
