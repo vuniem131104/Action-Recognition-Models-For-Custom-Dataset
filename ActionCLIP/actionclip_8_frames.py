@@ -10,7 +10,7 @@ from torch import nn
 from argparse import ArgumentParser
 import cv2
 from collections import deque
-from pymilvus import MilvusClient
+from pymilvus import MilvusClient, Collection
 
 def remove_module_prefix(state_dict):
     new_state_dict = {}
@@ -210,11 +210,12 @@ def predict_action_video(video_id, query_list):
 def push_to_milvus(action_results, db_name='milvus.db', is_insert=False):
     
     dim = 2048
-    num_people = 2
+    num_people = len(action_results)
     features = [np.random.random((dim, )) for _ in range(num_people)]
     results = action_results.copy()
-    results[0].append(features[0])
-    results[1].append(features[1])   
+    
+    for i in range(num_people):
+        results[i].append(features[i])
     
     client = MilvusClient(db_name)   
      
@@ -223,8 +224,15 @@ def push_to_milvus(action_results, db_name='milvus.db', is_insert=False):
             collection_name="collection",
             dimension=dim
         )
+        
+    res = client.query(
+        collection_name="collection",
+        output_fields=["count(*)"]
+    )
 
-    data = [{"id": i + 4, "frame_id": result[0], "person_id": result[1], "x1": result[2], "y1": result[3],
+    count = res[0]['count(*)']
+
+    data = [{"id": i + count, "frame_id": result[0], "person_id": result[1], "x1": result[2], "y1": result[3],
              "x2": result[4], "y2": result[5], "vector": result[7], "action": result[6]} 
             for i, result in enumerate(results)]
     
