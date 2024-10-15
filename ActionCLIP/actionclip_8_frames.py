@@ -173,7 +173,7 @@ def predict_action_video(video_id, query_list, id2action, model, fusion_model, t
 
     return results
 
-def push_to_milvus(action_results, db_name='./milvuss.db', is_insert=False):
+def push_to_milvus(action_results, db_name='./milvus.db', is_insert=False):
     
     dim = 2048
     num_people = len(action_results)
