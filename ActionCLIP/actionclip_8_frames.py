@@ -10,7 +10,10 @@ from torch import nn
 from argparse import ArgumentParser
 import cv2
 from collections import deque
-from pymilvus import MilvusClient, Collection
+from pymilvus import MilvusClient
+import json
+from sklearn.cluster import KMeans
+from tqdm.auto import tqdm
 
 def remove_module_prefix(state_dict):
     new_state_dict = {}
@@ -30,48 +33,6 @@ def text_prompt(text_aug, actions):
     classes = torch.cat([v for k, v in text_dict.items()])
 
     return classes, num_text_aug, text_dict
-
-parser = ArgumentParser()
-
-parser.add_argument(
-    '--video_id', type=str, help='Input video id.', required=True
-)
-
-parser.add_argument(
-    '--filter_action_prob', type=float, help='The probability to filter specific actions', default=0.4
-)
-
-args = parser.parse_args()
-
-results = list()
-text_aug = [f"The person is {{}}" ,f"The man is {{}}", f"The woman is {{}}", f"The human is {{}}", f"a photo of action {{}}" ,f"a picture of action {{}}",
-            f"a video of action {{}}", f"Human action of {{}}"]
-
-actions = ['sitting', 'standing', 'walking', 'interacting with others', 'doing others', 'using smartphone', 'cleaning the house']
-
-id2action = {k: v for k, v in enumerate(actions)}
-
-device = "cuda" if torch.cuda.is_available() else "cpu"  
-
-model, clip_state_dict = clip.load('ViT-B/16', device=device,
-                                    jit=False) 
-
-fusion_model = visual_prompt('Transf', clip_state_dict, 8)
-
-classes, _, _ = text_prompt(text_aug, actions)
-
-if os.path.exists(os.path.join('checkpoints', 'vit-b-16-8f.pt')):
-    checkpoint = torch.load(os.path.join('checkpoints', 'vit-b-16-8f.pt'), map_location='cpu') if device == 'cpu' \
-    else torch.load(os.path.join('checkpoints', 'vit-b-16-8f.pt'))
-    model.load_state_dict(remove_module_prefix(checkpoint['model_state_dict']))
-    fusion_model.load_state_dict(remove_module_prefix(checkpoint['fusion_model_state_dict']))
-
-fusion_model = fusion_model.to(device)
-model.eval()
-fusion_model.eval()
-
-text_inputs = classes.to(device)
-text_features = model.encode_text(text_inputs)
 
 
 class TextCLIP(nn.Module):
@@ -100,10 +61,10 @@ class GroupTransform(object):
 def get_augmentation():
     input_mean = [0.48145466, 0.4578275, 0.40821073]
     input_std = [0.26862954, 0.26130258, 0.27577711]
-    scale_size = 256
+    scale_size = data['ActionCLIP_args']['scale_size']
 
     unique = torchvision.transforms.Compose([GroupScale(scale_size),
-                                                 GroupCenterCrop(224)])
+                                                 GroupCenterCrop(data['ActionCLIP_args']['image_size'])])
 
     common = torchvision.transforms.Compose([Stack(roll=False),
                                              ToTorchFormatTensor(div=True),
@@ -116,9 +77,9 @@ def transform_images():
     images = list()
     for seg_ind in segment_indices:
         try:
-            seg_imgs = load_image('tmp', seg_ind)
+            seg_imgs = load_image(data['ActionCLIP_args']['images_folder'], seg_ind)
         except OSError:
-            print('ERROR: Could not read image "{}"'.format('tmp'))
+            print('ERROR: Could not read image "{}"'.format(data['ActionCLIP_args']['images_folder']))
             print('invalid indices: {}'.format(segment_indices))
             raise
         images.extend(seg_imgs)
@@ -130,11 +91,11 @@ def load_image(directory, idx):
     return [Image.open(os.path.join(directory, 'img_{:05d}.png'.format(idx))).convert('RGB')]
 
 def predict_action(frames, id2action, model, fusion_model, text_features, device, text_aug):
-    tmp_folder = 'tmp'
+    tmp_folder = data['ActionCLIP_args']['images_folder']
     if not os.path.exists(tmp_folder):
         os.makedirs(tmp_folder)
     for i, frame in enumerate(frames):
-        cv2.imwrite('tmp/img_{:05d}.png'.format(i + 1), frame)
+        cv2.imwrite('{}/img_{:05d}.png'.format(data['ActionCLIP_args']['images_folder'], i + 1), frame)
     image = transform_images().unsqueeze(dim=0)
     with torch.no_grad():
         image = image.view((-1, 8, 3) + image.size()[-2:])
@@ -150,9 +111,10 @@ def predict_action(frames, id2action, model, fusion_model, text_features, device
         idx = similarity.argmax(dim=1).item()
         prob = torch.max(similarity, dim=1)[0]
         
-    return id2action[idx]
+    return id2action[idx] if prob > args.filter_action_prob else 'doing others'
 
-def predict_action_video(video_id, query_list):
+def predict_action_video(video_id, query_list, id2action, model, fusion_model, text_features, text_aug):
+    results = list()
     video_path = os.path.join(video_id + '.mp4')
 
     cap = cv2.VideoCapture(video_path)
@@ -173,7 +135,7 @@ def predict_action_video(video_id, query_list):
             
     first_item = next(iter(datas.items()))
     frame_cnt = (first_item[0] // 8) * 8
-    frame_id_predict = frame_cnt * 2
+    frame_id_predict = frame_cnt + 8
     
     while ret:
         if frame_cnt in datas:
@@ -183,10 +145,6 @@ def predict_action_video(video_id, query_list):
                 y1 = max(int(y11 - 40), 0)
                 x2 = min(int(x22 + 40), w)
                 y2 = min(int(y22 + 40), h)
-                x11 = max(int(x11), 0)
-                y11 = max(int(y11), 0)
-                x22 = max(int(x22), 0)
-                y22 = max(int(y22), 0)
 
                 if person_id not in object_frames:
                     object_frames[person_id] = deque(maxlen=8)
@@ -198,9 +156,13 @@ def predict_action_video(video_id, query_list):
                         action = predict_action(object_frames[person_id], id2action, model, fusion_model, text_features, device, text_aug)
                     else:
                         tmp_object_frames = list(object_frames[person_id]) + [frame[y1:y2, x1:x2]] * (8 - len(object_frames[person_id]))
+                        # out = cv2.VideoWriter('video.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 15, (224,224))
+                        # for frame_ in tmp_object_frames + tmp_object_frames:
+                        #     out.write(cv2.resize(frame_, (224, 224)))
+                        # out.release()
                         action = predict_action(tmp_object_frames, id2action, model, fusion_model, text_features, device, text_aug)
 
-                    results.append([frame_cnt, person_id, x11, y11, x22, y22, action])
+                    results.append([video_id, frame_cnt, person_id, x11, y11, x22, y22, action])
                 
 
         ret, frame = cap.read()
@@ -211,57 +173,157 @@ def predict_action_video(video_id, query_list):
 
     return results
 
-def push_to_milvus(action_results, db_name='milvus.db', is_insert=False):
+def push_to_milvus(action_results, db_name='./milvuss.db', is_insert=False):
     
     dim = 2048
     num_people = len(action_results)
     features = [np.random.random((dim, )) for _ in range(num_people)]
-    results = action_results.copy()
-    
-    for i in range(num_people):
-        results[i].append(features[i])
     
     client = MilvusClient(db_name)   
      
-    if not client.has_collection(collection_name="collection"):
+    if not client.has_collection(collection_name=data['VectorDB_args']['collection_name']):
         client.create_collection(
-            collection_name="collection",
+            collection_name=data['VectorDB_args']['collection_name'],
             dimension=dim
         )
         
     res = client.query(
-        collection_name="collection",
+        collection_name=data['VectorDB_args']['collection_name'],
         output_fields=["count(*)"]
     )
 
     count = res[0]['count(*)']
+    print(count)
 
-    data = [{"id": i + count, "frame_id": result[0], "person_id": result[1], "x1": result[2], "y1": result[3],
-             "x2": result[4], "y2": result[5], "vector": result[7], "action": result[6]} 
-            for i, result in enumerate(results)]
+    data_to_push = [{"id": i + count, "video_id": result[0], "frame_id": result[1], "person_id": result[2], "x1": result[3], "y1": result[4],
+             "x2": result[5], "y2": result[6], "vector": feature, "action": result[7]} 
+            for i, (result, feature)in enumerate(zip(action_results, features))]
     
     if is_insert:
         res = client.insert(
-            collection_name="collection",
-            data=data
+            collection_name=data['VectorDB_args']['collection_name'],
+            data=data_to_push
         )
     
-    res = client.query(
-        collection_name="collection",
-        filter="action == 'using smartphone'",
-    )
+    # res = client.query(
+    #     collection_name=data['VectorDB_args']['collection_name'],
+    #     filter="action == 'using smartphone'",
+    # )
     
     # res = client.search(
-    #     collection_name="collection",
+    #     collection_name=data['VectorDB_args']['collection_name'],
     #     data=[features[0]],
     #     limit=5
     # )
     
     print('Pushed to Milvus')
-
     
+def crop_and_save_video(x1, y1, x2, y2, frame_id, video_id, out):
+    video_path = f'{video_id}.mp4'
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id - 7)
+    
+    if not cap.isOpened():
+        print(f"Error: Could not open video {video_path}")
+        return
+    
+    cnt = frame_id - 7
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        cropped_frame = frame[y1:y2, x1:x2]
+        out.write(cv2.resize(cropped_frame, (224, 224)))
+        cnt += 1
+        if cnt == frame_id + 1:
+            break
+    
+    cap.release()
+    out.release()
+
+def clustering(video_id, folder="clusters", db_file='./milvus.db', collection="collection", method='kmeans', n_cluster=5):
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+    client = MilvusClient(db_file)
+    res = client.query(
+            collection_name=collection,
+            filter="action != ''",
+            output_fields=['id', 'video_id', 'frame_id', 'person_id', 'x1', 'y1', 'x2', 'y2', 'vector', 'action']
+        )
+
+    if method == 'kmeans':
+        kmeans = KMeans(n_clusters=n_cluster)
+
+    data = []
+    for item in res:
+        data.append(np.array(item['vector'], dtype=np.float32))
+        
+    kmeans.fit(data)
+
+    predicted_labels = kmeans.predict(data)
+
+    for i in tqdm(range(len(predicted_labels))):
+        if not os.path.exists(f'{folder}/cluster_{predicted_labels[i]}'):
+            os.makedirs(f'{folder}/cluster_{predicted_labels[i]}')
+        
+        x1, y1, x2, y2, frame_id, action = res[i]['x1'], res[i]['y1'], res[i]['x2'], res[i]['y2'], res[i]['frame_id'], res[i]['action']
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(f'{folder}/cluster_{predicted_labels[i]}/video_{i}.mp4', fourcc, 15, (224, 224))
+        crop_and_save_video(x1, y1, x2, y2, frame_id, video_id, out)
+
 
 if __name__ == '__main__':
+    parser = ArgumentParser()
+
+    parser.add_argument(
+        '--video_id', type=str, help='Input video id.', required=True
+    )
+
+    parser.add_argument(
+        '--config', type=str, help='Input config file.', required=True
+    )
+
+    parser.add_argument(
+        '--filter_action_prob', type=float, help='The probability to filter specific actions', default=0.3
+    )
+
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        data = json.load(f)
+
+
+    text_aug = [f"The person is {{}}" ,f"The man is {{}}", f"The woman is {{}}", f"The human is {{}}", f"a photo of action {{}}" ,f"a picture of action {{}}",
+                f"a video of action {{}}", f"Human action of {{}}"]
+
+    actions = data['ActionCLIP_args']['actions']
+
+    id2action = {k: v for k, v in enumerate(actions)}
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"  
+
+    model, clip_state_dict = clip.load(data['ActionCLIP_args']['model'], device=device,
+                                        jit=False) 
+
+    fusion_model = visual_prompt(data['ActionCLIP_args']['sim_header'], clip_state_dict, 8)
+
+    classes, _, _ = text_prompt(text_aug, actions)
+
+    if os.path.exists(data['ActionCLIP_args']['checkpoint']):
+        checkpoint = torch.load(data['ActionCLIP_args']['checkpoint'], map_location='cpu') if device == 'cpu' \
+        else torch.load(os.path.join('checkpoints', 'vit-b-16-8f.pt'))
+        model.load_state_dict(remove_module_prefix(checkpoint['model_state_dict']))
+        fusion_model.load_state_dict(remove_module_prefix(checkpoint['fusion_model_state_dict']))
+
+
+    fusion_model = fusion_model.to(device)
+    model.eval()
+    fusion_model.eval()
+
+    text_inputs = classes.to(device)
+    text_features = model.encode_text(text_inputs)
     video_id = args.video_id
     query_list = [
             ["VTP_BDV2_1307_1280_720_180", 9, 1, 393, 212, 393+143, 212+301, 0.8740782737731934],
@@ -279,9 +341,12 @@ if __name__ == '__main__':
             ["VTP_BDV2_1307_1280_720_180", 15, 1, 401, 207, 401+135, 207+299, 0.8842822909355164],
             ["VTP_BDV2_1307_1280_720_180", 15, 2, 729, 484, 729+179, 484+231, 0.8580175638198853]
         ]
-    action_results = predict_action_video(video_id, query_list)
+    action_results = predict_action_video(video_id, query_list, id2action, model, fusion_model, text_features, text_aug)
     print(action_results)
+    push_to_milvus(action_results, is_insert=True)
     
-    push_to_milvus(action_results, 'milvus.db', True)
+    # clustering('VTP_BDV2_1307_1280_720_20_1729_1749', data['Cluster_args']['cluster_folder'], 
+    #            data['VectorDB_args']['database_file'], data['VectorDB_args']['collection_name'], 
+    #            data['Cluster_args']['cluster_method'], data['Cluster_args']['n_clusters'])
     
     
